@@ -1,0 +1,10 @@
+# 运行时凭据与产物，绝不提交
+__pycache__/
+*.pyc
+config.json
+cookies.json
+session.json
+mp_cookie.json
+letter.json
+题库.json
+*.log

@@ -1,0 +1,7 @@
+{
+  "username": "",
+  "password": "",
+  "display_name": "",
+  "password_verified": false,
+  "_note": "浙江大学统一认证账号。username 填学号；password 填统一认证密码（仅支持 ASCII，统一认证加密算法对非 ASCII 有损）；display_name 用于草稿发件人显示名；password_verified=true 表示密码已登录验证通过（此标志由脚本自动维护，手工填写后保持 false，登录成功后脚本会自动置 true）。首次使用：复制本文件为同目录 config.json 并填入你的账号。config.json 含明文密码，只存本机，不要提交到 git。"
+}

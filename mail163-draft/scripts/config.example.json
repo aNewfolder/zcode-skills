@@ -1,0 +1,7 @@
+{
+  "username": "",
+  "password": "",
+  "display_name": "",
+  "password_verified": false,
+  "_note": "163邮箱账号信息。username 填完整邮箱地址（如 yourname@163.com）；password 填邮箱密码或客户端授权码；display_name 用于草稿发件人显示名，可为空（此时用邮箱账号默认名）；password_verified=true 表示该密码已通过浏览器登录实测（由登录流程自动维护，手工改密码后请改回 false）。首次使用：复制本文件为同目录 config.json 并填入你的账号。config.json 含明文密码，只存本机，不要提交到 git。"
+}

@@ -1,0 +1,13 @@
+{
+  "to": ["example@somedomain.com"],
+  "cc": [],
+  "subject": "关于XXX的申请",
+  "salutation": "尊敬的X老师：",
+  "paragraphs": [
+    "您好！我是xxx，冒昧来信想向您请教/申请……（第一段，首行自动缩进两字符）",
+    "第二段内容……中文将渲染为仿宋小四，英文与数字自动使用 Times New Roman。"
+  ],
+  "closing": true,
+  "signature": "学生：<你的姓名>",
+  "date": "2026年9月21日"
+}
