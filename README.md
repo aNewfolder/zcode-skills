@@ -27,6 +27,7 @@
 | [zjuem-mail-draft](zjuem-mail-draft/) | 浙大邮箱公文排版存草稿（统一认证 API 登录 + Coremail 接口） | 只存草稿绝不发送 |
 | [cc98-crawler](cc98-crawler/) | 浙大 CC98 论坛帖子搜索、正文与附件抓取、本地全文检索 | 仅校园网 / WebVPN |
 | [cc98-viewer](cc98-viewer/) | 校外经 WebVPN 实时看 CC98 新帖、页内阅读 | 与 cc98-crawler 共用脚本 |
+| [piano-room-booking](piano-room-booking/) | 浙大琴房自动预约：放票时刻自动登录抢琴房，含手机网页控制台管理计划与订单 | 需自有服务器 + 校园网隧道 |
 | [wechat-article-reader](wechat-article-reader/) | 微信公众号推文完整归档（Markdown + 本地化图片音视频），免登录读最新推送 | 被风控时有浏览器兜底 |
 
 ## 怎么用

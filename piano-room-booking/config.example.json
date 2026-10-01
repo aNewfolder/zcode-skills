@@ -1,0 +1,19 @@
+{
+  "username": "",
+  "password": "",
+  "timezone": "Asia/Shanghai",
+  "open_time": "08:00",
+  "login_lead_seconds": 25,
+  "advance_days": 3,
+  "campus": "紫金港校区",
+  "room_preference": [
+    "西三B212-1", "西三B212-6", "西三B212-3", "西三B212-4",
+    "西三B212-5", "西三B214", "西三B210-2", "西三B212-2"
+  ],
+  "targets": [
+    { "weekday": 1, "start": "08:00", "end": "10:00" },
+    { "weekday": 2, "start": "08:00", "end": "10:00" }
+  ],
+  "retry_seconds": 120,
+  "http_timeout": 20
+}
