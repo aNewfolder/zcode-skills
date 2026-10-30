@@ -27,6 +27,7 @@
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -40,6 +41,7 @@ import requests
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = BASE_DIR / "config.json"
 LOG_FILE = BASE_DIR / "piano_booking.log"
+WATCH_FILE = BASE_DIR / "watch.json"
 
 # ---------------- 常量(抓包所得,勿随意改动) ----------------
 CAS_LOGIN_URL = (
@@ -65,7 +67,10 @@ UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
 WEEKDAY_NAMES = {1: "周一", 2: "周二", 3: "周三", 4: "周四",
                  5: "周五", 6: "周六", 7: "周日"}
 MSG_NOT_OPEN = ("不可预约", "提前", "开放时间", "未到", "暂未")
-MSG_CONFLICT = ("已被预约", "冲突", "已满", "有效预约", "占用")
+MSG_CONFLICT = ("已被预约", "冲突", "已满", "有效预约", "占用",
+                "被其他同学预约")  # 2026-10-05: 实际售罄报错是"该时段刚被其他同学预约"
+MSG_DAY_LIMIT = ("累计预约时长",)  # 单日累计预约时长触顶: 按人按天计, 换房间/重试无用
+DAY_LIMIT_MIN = 120               # 学校端上限: 每使用日累计 2 小时(与单数无关)
 
 
 # ---------------- 日志 ----------------
@@ -94,9 +99,10 @@ def log(msg: str):
 # ---------------- 配置 ----------------
 def load_config(path: Path) -> dict:
     cfg = json.loads(path.read_text(encoding="utf-8"))
-    for key in ("username", "password"):
-        if not cfg.get(key):
-            raise SystemExit(f"config.json 缺少 {key}")
+    if not cfg.get("username"):
+        raise SystemExit("config.json 缺少 username")
+    # 密码允许缺席(多用户共享版: 普通用户密码不落盘, 会话失效由面板续期);
+    # 需要密码的路径(login_with_retry)自带 NEEDS_RELOGIN 守卫
     cfg.setdefault("timezone", "Asia/Shanghai")
     cfg.setdefault("open_time", "08:00")
     cfg.setdefault("login_lead_seconds", 25)
@@ -104,7 +110,7 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("campus", "紫金港校区")
     cfg.setdefault("room_preference", [
         "西三B212-2", "西三B212-3", "西三B212-1", "西三B212-4",
-        "西三B212-5", "西三B212-6", "西三B214", "西三B210-2",
+        "西三B212-5", "西三B212-6",
     ])
     cfg.setdefault("targets", [
         {"weekday": 1, "start": "08:00", "end": "10:00"},
@@ -113,6 +119,17 @@ def load_config(path: Path) -> dict:
     cfg.setdefault("retry_seconds", 120)
     cfg.setdefault("http_timeout", 20)
     cfg.setdefault("proxy", "")  # 如 "http://127.0.0.1:8888" (EasyConnect 容器代理)
+    # 候补(捡漏): 约满的时段持续短间隔扫描, 有人取消即自动补约
+    cfg.setdefault("watch_enabled", True)       # 抢票约满自动进入候补
+    cfg.setdefault("watch_interval", 60)        # 扫描间隔秒(下限 30, 防刷接口)
+    cfg.setdefault("watch_stop_lead_min", 120)  # 距开始不足 N 分钟停止扫描
+    cfg.setdefault("watch_start_lead_min", 0)   # 距开始 N 分钟内才开始扫(0=入队即扫)
+    cfg.setdefault("feishu_webhook", "")        # 飞书群自定义机器人 webhook
+    # 入场签到监控: 开始后 late_min 分钟内未签到会被学校端判爽约(no_show)
+    cfg.setdefault("checkin_watch_enabled", True)  # 检测到签到/爽约时提醒(推送仅站长)
+    cfg.setdefault("checkin_interval", 180)     # 签到轮询间隔秒
+    cfg.setdefault("checkin_late_min", 15)      # 签到窗口(开始后 N 分钟内)
+    cfg.setdefault("checkin_remind_min", 5)     # 开场 N 分钟仍未签到即提醒(窗口关闭前留人肉补救时间)
     return cfg
 
 
@@ -163,6 +180,29 @@ def cas_login(username: str, password: str, timeout: int,
     return s
 
 
+def session_to_dict(s) -> dict:
+    """会话 cookie 落盘(仅 cookie, 绝不含密码)。"""
+    try:
+        return {"cookies": requests.utils.dict_from_cookiejar(s.cookies),
+                "ts": time.time()}
+    except Exception:
+        return {"cookies": {}, "ts": time.time()}
+
+
+def session_from_dict(d, proxy: str = "") -> requests.Session:
+    """从落盘的 cookie 重建会话(UA/代理与登录路径保持一致)。"""
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA})
+    if proxy:
+        s.proxies.update({"http": proxy, "https": proxy})
+    try:
+        s.cookies.update(
+            requests.utils.cookiejar_from_dict(d.get("cookies") or {}))
+    except Exception:
+        pass
+    return s
+
+
 # ---------------- 业务接口封装 ----------------
 def api_get(s, path, params=None, timeout=20):
     r = s.get(SERVICE_BASE + path, params=params, timeout=timeout)
@@ -177,11 +217,26 @@ def api_invoke(s, fn, payload, timeout=20):
     return r.json()
 
 
+def check_api_code(j, what):
+    """查询类接口统一校验: 网关会话失效时 HTTP 仍为 200, 返回
+    {"code":401,"message":"login field","data":null}, 若不校验, 上层的
+    `or []` 会静默当成空数据(2026-10-13 网页「看不到预约」事故根因)。
+    抢票提交路径不走此校验(冲突/403 噪声由 book_run 按 code 处理)。"""
+    if not isinstance(j, dict) or j.get("code") != 200:
+        code = j.get("code") if isinstance(j, dict) else type(j).__name__
+        msg = j.get("message") if isinstance(j, dict) else ""
+        raise RuntimeError(f"{what}返回异常(code={code}, msg={msg!r}), "
+                           f"登录会话可能已失效")
+    return j
+
+
 def search_form(s, form_uuid, timeout=20):
-    j = api_get(s, f"/{APP_TYPE}/v1/form/advancedSearch.json",
+    j = check_api_code(
+        api_get(s, f"/{APP_TYPE}/v1/form/advancedSearch.json",
                 params={"appType": APP_TYPE, "formUuid": form_uuid,
                         "currentPage": 1, "pageSize": 100,
-                        "conditionType": "AND"}, timeout=timeout)
+                        "conditionType": "AND"}, timeout=timeout),
+        "表单查询")
     res = j.get("result") or {}
     return res.get("data") or []
 
@@ -198,8 +253,20 @@ def campus_map(s, timeout=20):
     return {c["formInstId"]: c.get("campus_name") for c in campuses}
 
 
+def is_multi_room(r) -> bool:
+    """多人琴房判定: capacity>1 或名称含"多人"(2026-10-27 起全局禁约,
+    预约/候补/网页共用 load_rooms, 在此一处过滤即全路径生效)。"""
+    try:
+        cap = val(r.get("capacity"))
+        if cap is not None and int(cap) > 1:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return "多人" in (r.get("room_name") or "")
+
+
 def load_rooms(s, cfg, cmap, timeout=20):
-    """候选琴房: active、免审批、目标校区, 按配置优先级排序。"""
+    """候选琴房: active、免审批、非多人、目标校区, 按配置优先级排序。"""
     rooms = search_form(s, FORM_PIANO_ROOM, timeout)
     picked = []
     for r in rooms:
@@ -207,6 +274,8 @@ def load_rooms(s, cfg, cmap, timeout=20):
             continue
         if val(r.get("requires_approval")) == "yes":
             continue  # 普通琴房才免审批即时生效
+        if is_multi_room(r):
+            continue  # 全局禁止预约多人琴房
         if cmap.get(r.get("campus_id")) != cfg["campus"]:
             continue
         picked.append(r)
@@ -239,11 +308,27 @@ def load_advance_rule(s, timeout=20):
 
 
 def list_my_orders(s, timeout=20):
-    j = api_invoke(s, FN_QUERY, {"action": "list_my_orders",
+    j = check_api_code(
+        api_invoke(s, FN_QUERY, {"action": "list_my_orders",
                                  "currentPage": 1, "pageSize": 50,
-                                 "statusTab": "all"}, timeout)
+                                 "statusTab": "all"}, timeout),
+        "订单查询")
     data = j.get("data") or {}
     return (data.get("result") or {}).get("items") or []
+
+
+def list_access_permissions(s, dates, timeout=20):
+    """读取门禁权限记录(含门禁密码 entrance_pwd), 官方入场凭证页同源。
+
+    dates 为使用日期字符串列表(YYYY-MM-DD); 返回记录含 order_id(=订单
+    instanceId)/order_no/entrance_pwd/permission_status 等字段。
+    """
+    j = check_api_code(
+        api_invoke(s, FN_QUERY, {"action": "get_context", "dates": dates},
+                   timeout),
+        "门禁权限查询")
+    return ((j.get("data") or {}).get("result") or {}).get(
+        "accessPermissions") or []
 
 
 def submit_booking(s, room, campus_name, date_str, start, end, timeout=20):
@@ -262,6 +347,72 @@ def submit_booking(s, room, campus_name, date_str, start, end, timeout=20):
     msg = j.get("message") or ""
     order = ((j.get("data") or {}).get("result") or {}).get("order") or {}
     return code, msg, order
+
+
+# ---------------- 时段占用查询(官方选房格同源, 2026-10-27) ----------------
+# 官方 App 前端把时段分为: available=可约; reserved/booked/waiting_use/
+# pending_payment/pending_approval/hold=已约(学生订单); occupied/
+# admin_occupy=占用(管理方锁定)。服务端 submit 只仲裁学生订单冲突, 不拦
+# 管理方占用段(2026-10-27 实测约进过官方显示"占用"的时段), 故提交前
+# 须自查, 落在占用段内的琴房一律跳过。
+AVAIL_FREE = ("available", "")
+AVAIL_OCCUPIED = ("occupied", "admin_occupy")
+AVAIL_TTL = 60  # 占用数据缓存秒(与候补扫描节奏同量级, 防刷接口)
+_avail_cache = {}  # date -> (ts, records or None)
+
+
+def get_availability(s, date_str, rooms, timeout=20):
+    """某日候选琴房的时段状态记录(官方选房格同源)。失败返回 None,
+    调用方放行——辅助接口故障不得阻断抢票主流程。"""
+    hit = _avail_cache.get(date_str)
+    if hit and time.time() - hit[0] < AVAIL_TTL:
+        return hit[1]
+    recs = None
+    try:
+        payload = {"action": "get_availability", "date": date_str,
+                   "rooms": [{"roomId": r.get("formInstId"),
+                              "ranges": [{"startTime": "08:00",
+                                          "endTime": "22:00"}]}
+                             for r in rooms if r.get("formInstId")]}
+        j = api_invoke(s, FN_QUERY, payload, timeout)
+        recs = ((j.get("data") or {}).get("result") or {}).get(
+            "availability")
+    except Exception:
+        recs = None
+    if len(_avail_cache) > 50:
+        _avail_cache.clear()
+    _avail_cache[date_str] = (time.time(), recs)
+    return recs
+
+
+def occupation_block(recs, room, start, end):
+    """(琴房, start, end) 是否落在管理方占用段内。返回占用状态串或 ""。
+    学生订单冲突(booked 等)不在此拦: 服务端会仲裁, 且抢票瞬间占用缓存
+    可能滞后, 误拦会错过刚放出的新票。"""
+    if not recs:
+        return ""
+    rid = room.get("formInstId")
+
+    def minutes(t):
+        h, m = map(int, str(t).split(":")[:2])
+        return h * 60 + m
+
+    try:
+        s0, e0 = minutes(start), minutes(end)
+    except (TypeError, ValueError):
+        return ""
+    for rec in recs:
+        if rec.get("room_id") != rid:
+            continue
+        try:
+            a, b = minutes(rec.get("start_time")), minutes(rec.get("end_time"))
+        except (TypeError, ValueError):
+            continue
+        if a < e0 and b > s0:  # 与目标时段有重叠
+            st = str(val(rec.get("slot_status")) or rec.get("slot_status") or "")
+            if st in AVAIL_OCCUPIED:
+                return st
+    return ""
 
 
 def form_update(s, form_uuid, instance_id, data, timeout=20):
@@ -380,7 +531,8 @@ def compute_targets(cfg, advance_days=None, open_time=None):
 
     支持三种计划条目:
       {"date": "YYYY-MM-DD", "start", "end"}  指定日期预约(替代当天每周计划)
-      {"date": "YYYY-MM-DD", "skip": true}    该日期不自动预约
+      {"date": "YYYY-MM-DD", "skip": true}    该日期不自动预约(仅抑制每周计划,
+                                              当天显式单次计划仍会提交)
       {"weekday": 1-7, "start", "end"}        每周重复
     """
     now = now_in(cfg)
@@ -393,7 +545,7 @@ def compute_targets(cfg, advance_days=None, open_time=None):
 
     def push(use_date, st, et, delta):
         key = (use_date, st, et)
-        if key not in seen and use_date not in skip_dates:
+        if key not in seen:
             seen.add(key)
             results.append((use_date, st, et, delta))
 
@@ -424,6 +576,8 @@ def compute_targets(cfg, advance_days=None, open_time=None):
             use_date = (now + timedelta(days=delta)).date().isoformat()
             if use_date in dated_dates:
                 continue  # 当天被单次计划替代
+            if use_date in skip_dates:
+                continue  # 该天不约(只挡每周计划, 当天的单次计划照常提交)
             if delta > days:
                 continue  # 还没放票
             if delta == 0:
@@ -450,39 +604,177 @@ def active_booked_keys(orders):
     return keys
 
 
+def daily_booked_minutes(orders):
+    """每个使用日已有有效订单的累计时长(分钟)。
+
+    学校端上限是每日累计 2 小时而非 2 单: 一个 2 小时订单即触顶, 之后当天
+    任何提交都会被拒(400 单日累计预约时长)。2026-10-23 08:00 调度在已触顶的
+    当天目标上空耗 2 分钟才轮到新票目标的教训, 本地预判用它熔断。
+    """
+    out = {}
+    for o in orders:
+        d = (o.get("use_date") or "")[:10]
+        status = str(val(o.get("order_status")) or "")
+        if not d or status in ("cancelled", "refunded", "rejected", "closed"):
+            continue
+        try:
+            sh, sm = map(int, str(o.get("start_time")).split(":")[:2])
+            eh, em = map(int, str(o.get("end_time")).split(":")[:2])
+        except (ValueError, AttributeError):
+            continue
+        out[d] = out.get(d, 0) + max(0, (eh * 60 + em) - (sh * 60 + sm))
+    return out
+
+
+# ---------------- 候补队列(捡漏) ----------------
+_WATCH_MAX = 12
+
+
+def load_watch():
+    """候补条目: [{date, start, end, source, added_at}]。"""
+    try:
+        data = json.loads(WATCH_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [x for x in data if isinstance(x, dict)
+            and x.get("date") and x.get("start") and x.get("end")]
+
+
+def save_watch(items):
+    tmp = WATCH_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(items, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, WATCH_FILE)  # 原子写: 网页进程与守护进程并发访问
+
+
+def add_watch(date_str, start, end, source="auto"):
+    """加入候补队列(按 时段 去重), 返回是否新增。"""
+    date_str, start, end = str(date_str)[:10], str(start), str(end)
+    items = load_watch()
+    if any(x["date"] == date_str and x["start"] == start
+           and x["end"] == end for x in items):
+        return False
+    if len(items) >= _WATCH_MAX:
+        log(f"候补队列已满({_WATCH_MAX} 条), 忽略: {date_str} {start}-{end}")
+        return False
+    items.append({"date": date_str, "start": start, "end": end,
+                  "source": source,
+                  "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    items.sort(key=lambda x: (x["date"], x["start"]))
+    save_watch(items)
+    log(f"候补队列: + {date_str} {start}-{end} ({source}), 共 {len(items)} 条")
+    return True
+
+
+def remove_watch(date_str, start=None, end=None):
+    """移除候补条目, 返回移除数量。start/end 为 None 时按日期全删。"""
+    items = load_watch()
+    kept = [x for x in items
+            if not (x["date"] == str(date_str)[:10]
+                    and (start is None or x["start"] == str(start))
+                    and (end is None or x["end"] == str(end)))]
+    if len(kept) != len(items):
+        save_watch(kept)
+        log(f"候补队列: - {date_str} {start or ''}-{end or ''}, "
+            f"剩 {len(kept)} 条")
+    return len(items) - len(kept)
+
+
+def feishu_notify(cfg, text):
+    """飞书群自定义机器人通知(光电hot 项目同款 webhook 协议)。
+    未配置 webhook 时仅记日志, 不报错。"""
+    url = str(cfg.get("feishu_webhook") or "").strip()
+    if not url:
+        log("飞书通知(未配置 webhook, 仅日志): " + text.splitlines()[0])
+        return False
+    try:
+        r = requests.post(url, json={"msg_type": "text",
+                                     "content": {"text": text}}, timeout=10)
+        j = r.json()
+        code = j.get("code", j.get("StatusCode", 0))
+        ok = r.status_code == 200 and int(code or 0) == 0
+        if not ok:
+            log(f"飞书通知被拒: HTTP {r.status_code} {str(j)[:200]}")
+        return ok
+    except Exception as e:
+        log(f"飞书通知失败: {e}")
+        return False
+
+
+def login_with_retry(cfg, attempts=4, wait=6):
+    """CAS 登录, 失败重试。VPN 代理存在周期性短暂中断, 需容忍。"""
+    if not cfg.get("password"):
+        raise RuntimeError("NEEDS_RELOGIN: 配置中没有已保存的密码, "
+                           "需要用户重新输入密码续期会话")
+    last = None
+    timeout = min(cfg["http_timeout"], 10)  # 快速失败, 给重试留时间
+    for i in range(attempts):
+        try:
+            return cas_login(cfg["username"], cfg["password"],
+                             timeout, cfg["proxy"])
+        except Exception as e:
+            last = e
+            log(f"CAS 登录失败({e.__class__.__name__}: {e}), "
+                f"{wait}s 后重试({i + 1}/{attempts})")
+            time.sleep(wait)
+    raise last
+
+
 # ---------------- 核心流程 ----------------
 def book_run(cfg, dry_run=False, session=None):
     now = now_in(cfg)
     log(f"===== 开始预约流程 (dry_run={dry_run}, now={now.strftime('%F %T')}) =====")
 
-    s = session or cas_login(cfg["username"], cfg["password"],
-                             cfg["http_timeout"], cfg["proxy"])
-    cmap = campus_map(s, cfg["http_timeout"])
+    s = session or login_with_retry(cfg)
 
-    adv_days, adv_open = load_advance_rule(s, cfg["http_timeout"])
+    prep = None
+    for i in range(3):
+        try:
+            cmap = campus_map(s, cfg["http_timeout"])
+            adv_days, adv_open = load_advance_rule(s, cfg["http_timeout"])
+            rooms = load_rooms(s, cfg, cmap, cfg["http_timeout"])
+            my_orders = list_my_orders(s, cfg["http_timeout"])
+            booked = active_booked_keys(my_orders)
+            daymin = daily_booked_minutes(my_orders)
+            prep = (cmap, adv_days, adv_open, rooms, booked, daymin)
+            break
+        except Exception as e:
+            log(f"读取预约数据失败({e.__class__.__name__}: {e}), "
+                f"10s 后重试({i + 1}/3)")
+            time.sleep(10)
+    if prep is None:
+        log("预约数据持续读取失败, 结束( VPN 代理可能中断)")
+        return
+    cmap, adv_days, adv_open, rooms, booked, daymin = prep
     if adv_days is None:
         adv_days, adv_open = cfg["advance_days"], cfg["open_time"]
     log(f"预约规则: 提前 {adv_days} 天, 每日 {adv_open} 放票")
 
     targets = compute_targets(cfg, adv_days)
+    # 新放票的日期(窗口内最晚一天)最紧俏, 开票瞬间先约它; 同日按时段升序
+    targets.sort(key=lambda t: t[1])
+    targets.sort(key=lambda t: t[0], reverse=True)
     if not targets:
         log("今天没有待预约的目标日期(均未放票或已错过), 结束")
         return
 
-    rooms = load_rooms(s, cfg, cmap, cfg["http_timeout"])
     log(f"候选琴房 {len(rooms)} 间: " +
         ", ".join(r.get("room_name") or "?" for r in rooms))
     if not rooms:
         log("没有候选琴房, 结束")
         return
 
-    booked = active_booked_keys(list_my_orders(s, cfg["http_timeout"]))
     pending = []
     for date_str, st, et, delta in targets:
         wd = datetime.fromisoformat(date_str).isoweekday()
         desc = f"{date_str}({WEEKDAY_NAMES[wd]}) {st}-{et}, {delta} 天后"
         if (date_str, st, et) in booked:
             log(f"跳过 {desc}: 已有订单")
+        elif daymin.get(date_str, 0) >= DAY_LIMIT_MIN:
+            log(f"跳过 {desc}: 当日累计预约时长已达上限"
+                f"({daymin.get(date_str, 0)} 分钟)")
         else:
             log(f"待预约: {desc}")
             pending.append((date_str, st, et))
@@ -495,7 +787,14 @@ def book_run(cfg, dry_run=False, session=None):
     started = time.time()
     attempt = 0
     next_try = {}  # 全部琴房冲突的日期 -> 最早可再次尝试的时间(冷却15s,避免刷接口)
-    fail_kind = {}  # 未完成目标的最后失败类别: not_open/conflict/other
+    fail_kind = {}  # 未完成目标 -> {失败类别: 响应次数}, 汇报时取多数
+                    # 按琴房响应计票而非按轮计票: 约满轮 8 票, 偶发 403/网络抖动
+                    # 只有零星几票, 不会把"已约满"误报成"接口持续报错"(2026-10-05)
+
+    def note_fail(item, kind):
+        counts = fail_kind.setdefault(item, {})
+        counts[kind] = counts.get(kind, 0) + 1
+
     while pending and time.time() < deadline:
         attempt += 1
         for item in list(pending):
@@ -503,15 +802,30 @@ def book_run(cfg, dry_run=False, session=None):
             if time.time() < next_try.get((date_str, st, et), 0):
                 continue
             conflict_count = 0
+            occ = get_availability(s, date_str, rooms, cfg["http_timeout"])
             for room in rooms:
                 if dry_run:
                     log(f"[dry-run] 将提交: {date_str} {st}-{et} "
                         f"{room.get('room_name')}")
                     pending.remove(item)
                     break
-                code, msg, order = submit_booking(
-                    s, room, cmap.get(room.get("campus_id")) or cfg["campus"],
-                    date_str, st, et, cfg["http_timeout"])
+                blk = occupation_block(occ, room, st, et)
+                if blk:
+                    note_fail(item, "conflict")
+                    conflict_count += 1
+                    log(f"  {room.get('room_name')} {date_str} {st} "
+                        f"为管理方占用时段(官方显示占用:{blk}), 跳过")
+                    continue
+                try:
+                    code, msg, order = submit_booking(
+                        s, room, cmap.get(room.get("campus_id")) or cfg["campus"],
+                        date_str, st, et, cfg["http_timeout"])
+                except Exception as e:
+                    note_fail(item, "other")
+                    log(f"  {room.get('room_name')} 提交网络异常"
+                        f"({e.__class__.__name__}), 稍后重试")
+                    time.sleep(3)
+                    break  # 下一轮重来(VPN 短暂中断时让会话恢复)
                 if code == 200 and order:
                     log(f"预约成功! {date_str} {st}-{et} "
                         f"{order.get('room_name') or room.get('room_name')} "
@@ -519,24 +833,32 @@ def book_run(cfg, dry_run=False, session=None):
                     pending.remove(item)
                     break
                 if any(k in msg for k in MSG_NOT_OPEN):
-                    fail_kind[item] = "not_open"
+                    note_fail(item, "not_open")
                     log(f"  {date_str} 尚未放票({msg}), 稍后重试")
                     break  # 换房间没用, 等下一轮
                 if any(k in msg for k in MSG_CONFLICT):
+                    note_fail(item, "conflict")
                     conflict_count += 1
                     log(f"  {room.get('room_name')} {date_str} {st} 冲突: {msg}")
                     continue  # 试下一间
-                fail_kind[item] = "other"
+                if any(k in msg for k in MSG_DAY_LIMIT):
+                    note_fail(item, "daylimit")
+                    log(f"  {date_str} {st}-{et} 当日累计预约时长已达上限"
+                        f"({msg}), 当天剩余目标全部跳过")
+                    for other in list(pending):
+                        if other[0] == date_str:
+                            note_fail(other, "daylimit")
+                            pending.remove(other)
+                    break  # 换房间/换时段都没用
+                note_fail(item, "other")
                 log(f"  {room.get('room_name')} 提交失败(code={code}): {msg}")
                 if code == 401 or "登录" in msg:
                     log("会话失效, 重新登录")
-                    s = cas_login(cfg["username"], cfg["password"],
-                                  cfg["http_timeout"], cfg["proxy"])
+                    s = login_with_retry(cfg)
                     break
             else:
                 if conflict_count == len(rooms):
                     # 所有琴房都被占: 冷却 15s 后再试(可能有人取消锁定)
-                    fail_kind[item] = "conflict"
                     log(f"  {date_str} {st}-{et} 没有空余琴房"
                         f"(全部 {len(rooms)} 间已被约满), 15s 后再试")
                     next_try[(date_str, st, et)] = time.time() + 15
@@ -552,12 +874,23 @@ def book_run(cfg, dry_run=False, session=None):
     REASONS = {
         "conflict": "没有空余琴房(全部琴房该时段已被约满)",
         "not_open": "尚未放票",
+        "daylimit": "当日累计预约时长已达 2 小时上限",
         "other": "接口持续报错",
     }
+    # 同票数时的优先级: 已约满 > 时长触顶 > 未放票 > 接口异常(偶发 403/网络
+    # 抖动属噪声)
+    KIND_PRIORITY = ("conflict", "daylimit", "not_open", "other")
     for date_str, st, et in pending:
-        kind = fail_kind.get((date_str, st, et))
+        counts = fail_kind.get((date_str, st, et))
+        kind = max(counts, key=lambda k: (counts[k], -KIND_PRIORITY.index(k))) \
+            if counts else None
         log(f"未完成: {date_str} {st}-{et}: "
             f"{REASONS.get(kind, '未放票/已被抢完/持续失败')}")
+        if kind == "conflict" and not dry_run \
+                and cfg.get("watch_enabled", True) \
+                and add_watch(date_str, st, et, source="auto"):
+            log(f"  -> 已转入候补: 将由 piano-watch 持续扫描, "
+                f"有人取消即自动补约")
     log(f"===== 预约流程结束, 共尝试 {attempt} 轮 =====")
 
 

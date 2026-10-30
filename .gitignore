@@ -8,3 +8,12 @@ mp_cookie.json
 letter.json
 题库.json
 *.log
+
+# piano-room-booking 运行时敏感文件
+web_token.txt
+reg_token.txt
+myarts_cookies.json
+users.json
+watch.json
+hub_state.json
+users/

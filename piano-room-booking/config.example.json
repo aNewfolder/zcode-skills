@@ -7,13 +7,23 @@
   "advance_days": 3,
   "campus": "紫金港校区",
   "room_preference": [
-    "西三B212-1", "西三B212-6", "西三B212-3", "西三B212-4",
-    "西三B212-5", "西三B214", "西三B210-2", "西三B212-2"
+    "西三B212-1", "西三B212-2", "西三B212-3", "西三B212-4",
+    "西三B212-5", "西三B212-6"
   ],
   "targets": [
     { "weekday": 1, "start": "08:00", "end": "10:00" },
     { "weekday": 2, "start": "08:00", "end": "10:00" }
   ],
   "retry_seconds": 120,
-  "http_timeout": 20
+  "http_timeout": 20,
+  "proxy": "",
+  "watch_enabled": true,
+  "watch_interval": 60,
+  "watch_stop_lead_min": 120,
+  "watch_start_lead_min": 0,
+  "feishu_webhook": "",
+  "checkin_watch_enabled": true,
+  "checkin_interval": 180,
+  "checkin_late_min": 15,
+  "checkin_remind_min": 5
 }

@@ -27,7 +27,10 @@
 | [zjuem-mail-draft](zjuem-mail-draft/) | 浙大邮箱公文排版存草稿（统一认证 API 登录 + Coremail 接口） | 只存草稿绝不发送 |
 | [cc98-crawler](cc98-crawler/) | 浙大 CC98 论坛帖子搜索、正文与附件抓取、本地全文检索 | 仅校园网 / WebVPN |
 | [cc98-viewer](cc98-viewer/) | 校外经 WebVPN 实时看 CC98 新帖、页内阅读 | 与 cc98-crawler 共用脚本 |
-| [piano-room-booking](piano-room-booking/) | 浙大琴房自动预约：放票时刻自动登录抢琴房，含手机网页控制台管理计划与订单 | 需自有服务器 + 校园网隧道 |
+| [zju-atrust-vpn](zju-atrust-vpn/) | 校外服务器经 zju-connect(aTrust 协议)建浙大校网隧道，HTTP/SOCKS 代理访问校内系统 | 需自有服务器；旧 EasyConnect 方案已失效 |
+| [piano-room-booking](piano-room-booking/) | 浙大琴房自动预约：放票时刻自动抢 + 候补捡漏 + 签到监控 + 飞书通知，多人共享（注册/优先级/总控制台），手机网页管理 | 需自有服务器 + 校网隧道（配 zju-atrust-vpn） |
+| [mineru-md](mineru-md/) | PDF/图片/Office 经 MinerU API 高保真转 Markdown（公式/表格/双栏/扫描件，图片本地化） | 云端 API，只发可公开的文档 |
+| [zju-literature-downloader-skill](zju-literature-downloader-skill/) | 经你已登录的浙大图书馆/WebVPN 浏览器会话批量下载文献 PDF/SI，含 manifest、校验与验证重试 | 只用你自己的机构订阅权限，不绕付费墙 |
 | [wechat-article-reader](wechat-article-reader/) | 微信公众号推文完整归档（Markdown + 本地化图片音视频），免登录读最新推送 | 被风控时有浏览器兜底 |
 
 ## 怎么用

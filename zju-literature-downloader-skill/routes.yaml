@@ -1,0 +1,206 @@
+# routes.yaml — DOI 前缀 → 取 PDF 方式的路由表
+#
+# 设计：**DOI 与清单不写在这里**（那是数据）；这里只写"某出版社的 PDF 怎么拿"（那是方法）。
+# 每轮任务只需要给清单，路由表可以长期不改；出版社改版时只改这一个文件。
+#
+# mode 含义：
+#   direct_pdf  : 直接用 url 模板 fetch（同源或允许跨域时）
+#   via_landing : 先打开 landing 页（DOI 解析结果），再用 extract 里定义的方式取候选 URL
+#   refuse      : 已知取不到（付费墙/无权限），直接跳过并记录原因，不做无谓尝试
+
+defaults:
+  # 所有路由的公共行为
+  wait_after_navigate_ms: 6000      # 打开页面后等多久再读
+  fetch_in_page: true               # 一律在页面上下文 fetch（带机构 cookie）
+  reject_if_html: true              # 返回 text/html 视为失败（通常是付费墙页面）
+  max_attempts: 2
+
+routes:
+  # ---------- IEEE Xplore ----------
+  - prefix: "10.1109/"
+    publisher: IEEE Xplore
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      # 文章页里 arnumber 有两种来源：页面自带的 meta/JS 变量，或 URL 里的 document/<id>
+      arnumber_from: ["document\\.ieee\\.org/document/(\\d{6,9})", "arnumber[=\"':\\s]+(\\d{6,9})"]
+      # 拿到 arnumber 后，在同源上下文里取这个地址
+      pdf_url: "https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}&ref="
+    notes: "PDF 按钮是 javascript:void，必须走 getPDF.jsp；arnumber 从文章页取"
+
+  # ---------- Optica (OSA) ----------
+  - prefix: "10.1364/"
+    publisher: Optica Publishing Group
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      # 从 landing URL 里取 uri=aop-12-2-485 与期刊代码
+      uri_from: "uri=([a-z]+-\\d+-\\d+-\\d+)"
+      journal_from: "/(optica|oe|aop|prj|ol|prj|cleo)/"
+      pdf_url: "https://opg.optica.org/{journal}/viewmedia.cfm?uri={uri}&seq=0"
+    notes: "viewmedia 会 302 到 directpdfaccess 签名地址；直接 fetch 会拿到 Please wait 跳转页，需在 PDF 查看器里用 Page.getResourceContent 取字节"
+
+  # ---------- Nature Portfolio ----------
+  - prefix: "10.1038/"
+    publisher: Nature Portfolio
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      meta_pdf: "citation_pdf_url"                      # 页面 meta 里通常直接给 PDF 地址
+      # 兜底：文章页 URL 去掉 # 后加 .pdf（用 www.nature.com/articles/<id>.pdf，避免拼成 doi.org/....pdf）
+      pattern_pdf: "https://www.nature.com/articles/{doi_suffix}.pdf"
+    access_watch: ["Brought to you by", "Zhejiang", "Subscribe"]
+    notes: "Nature Photonics 等子刊本机构可能无权限（只显示 Subscribe）；有机构会话时正文可下"
+
+  # ---------- Science / AAAS ----------
+  - prefix: "10.1126/"
+    publisher: Science (AAAS)
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      meta_pdf: "citation_pdf_url"
+      pattern_pdf: "https://www.science.org/doi/pdf/{doi}?download=true"
+    notes: "文章页会显示 brought to you by；补充材料在 supplementary 页"
+
+  # ---------- AIP ----------
+  - prefix: "10.1063/"
+    publisher: AIP Publishing
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      meta_pdf: "citation_pdf_url"
+      anchor_text: ["PDF", "View PDF", "Download PDF"]
+    notes: "article-pdf 链接跨子域时 CORS 会拦；需在新标签页导航后同源 fetch（OA 文章可直接取）"
+
+  # ---------- Wiley ----------
+  - prefix: "10.1002/"
+    publisher: Wiley
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      # 不要写死 onlinelibrary.wiley.com：Summon 可能走 advanced.onlinelibrary.wiley.com
+      same_origin_pdf: "/doi/pdfdirect/{doi}?download=true"
+    notes: "必须用 location.origin 拼，否则跨域 fetch 失败；也不要直接导航到 pdfdirect（会触发下载，页面上下文失效）"
+
+  - prefix: "10.1111/"
+    publisher: Wiley
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      same_origin_pdf: "/doi/pdfdirect/{doi}?download=true"
+
+  # ---------- Springer Nature ----------
+  - prefix: "10.1007/"
+    publisher: Springer
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      pattern_pdf: "https://link.springer.com/content/pdf/{doi}.pdf"
+      meta_pdf: "citation_pdf_url"
+    notes: "机构登录完成后通常可用；直接 shell 下载会 401/403，需页面上下文 fetch。实测有返回空响应的情况，需重试"
+
+  - prefix: "10.1186/"
+    publisher: BMC (Springer Nature)
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      pattern_pdf: "https://link.springer.com/content/pdf/{doi}.pdf"
+    notes: "OA 刊，通常直接可取"
+
+  # ---------- Elsevier / ScienceDirect ----------
+  - prefix: "10.1016/"
+    publisher: Elsevier (ScienceDirect)
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      # 文章页 View PDF 是 pdfft?md5=... 的链接；点开后会跳到 pdf.sciencedirectassets.com 签名地址
+      anchor_text: ["View PDF", "Download PDF"]
+      signed_host: "pdf.sciencedirectassets.com"
+    manual_step: true
+    notes: "首次可能需要人工过 Are you a robot / 机构访问；签名 URL 有时效，过期需重新点 View PDF。补充材料是 _mmc 命名"
+
+  # ---------- ACS ----------
+  - prefix: "10.1021/"
+    publisher: ACS Publications
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      pattern_pdf: "https://pubs.acs.org/doi/pdf/{doi}"
+      suppl_pattern: "https://pubs.acs.org/doi/suppl/{doi}/suppl_file/{journalcode}_si_001.pdf"
+    notes: "supporting information 的 journalcode 需从正文页确认，不要凭空猜"
+
+  # ---------- RSC ----------
+  - prefix: "10.1039/"
+    publisher: RSC Publishing
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      anchor_text: ["PDF", "Download PDF"]
+    notes: "本机构不一定有权限；若返回 404/购买页，记 no_authorized_pdf_found，不要反复重试"
+
+  # ---------- Frontiers ----------
+  - prefix: "10.3389/"
+    publisher: Frontiers
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      pattern_pdf: "https://www.frontiersin.org/articles/{doi}/pdf"
+    notes: "OA；失败时打开文章页取可见 PDF 链接"
+
+  # ---------- bioRxiv / medRxiv ----------
+  - prefix: "10.1101/"
+    publisher: bioRxiv
+    mode: direct_pdf
+    extract:
+      pattern_pdf: "https://www.biorxiv.org/content/{doi}v1.full.pdf"
+    notes: "v1 404 时试文章页或更高版本；务必核对标题"
+
+  # ---------- IOP ----------
+  - prefix: "10.1088/"
+    publisher: IOP Publishing
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      meta_pdf: "citation_pdf_url"
+      anchor_text: ["PDF", "Download PDF"]
+
+  # ---------- 明确不可得（省得白试） ----------
+  - prefix: "10.1201/"        # CRC / Taylor & Francis 电子书
+    publisher: CRC Press
+    mode: refuse
+    reason: "电子书仅分章权限；整本不可下载"
+  - prefix: "10.1007/978-"    # Springer 电子书
+    publisher: Springer (book)
+    mode: refuse
+    reason: "电子书仅分章权限；需要章节级清单才能逐章取"
+  - prefix: "10.15302/"       # 中国工程科学 — 中文刊，页面结构特殊
+    publisher: 中国工程科学
+    mode: via_landing
+    landing: "https://doi.org/{doi}"
+    extract:
+      anchor_text: ["PDF", "全文下载", "下载"]
+    notes: "中文刊：首页可能给 DOI，可直接 Crossref 核对；PDF 链接在页面上，可能需要人工点一次"
+
+  # ---------- 其它已知不可得（标准 / 报告 / 专著 / 非学术页面） ----------
+  - prefix: "10.1145/"        # ACM：本机构通常无权限，且规范类条目无 PDF
+    publisher: ACM
+    mode: refuse
+    reason: "ACM 无机构权限；标准/规范类条目本就无 PDF，需官网人工下载"
+  - prefix: "10.1201/"
+    publisher: CRC Press
+    mode: refuse
+    reason: "电子书仅分章权限"
+  - prefix: "10.978/"
+    publisher: (unknown)
+    mode: refuse
+    reason: "无法识别的 DOI 形态"
+
+fallback:
+  # 未匹配任何前缀时：按 landing 页上的通用线索找 PDF
+  mode: via_landing
+  landing: "https://doi.org/{doi}"
+  extract:
+    meta_pdf: "citation_pdf_url"
+    anchor_text: ["PDF", "View PDF", "Get PDF", "Download PDF", "Full Text", "在线全文"]
+    iframe_pattern: "stamp\\.jsp|ielx|\\.pdf"
+  notes: "通用兜底：优先 meta[citation_pdf_url]，其次页面上的 PDF/全文链接与 PDF iframe"

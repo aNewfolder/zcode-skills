@@ -1,14 +1,25 @@
 # -*- coding: utf-8 -*-
-"""服务器最终部署:脚本+配置(带proxy)+VPN健康检查+端到端验证。
+"""服务器部署参考：脚本+配置(带proxy)+VPN健康检查+端到端验证。
 
-计划 targets 以服务器为准(网页控制台在线编辑), 默认不上传本地 targets;
+凭据与服务器信息一律从环境变量读取，指向你自己的服务器：
+  PIANO_DEPLOY_HOST  目标服务器 IP/域名（必填）
+  PIANO_DEPLOY_USER  SSH 用户（默认 root）
+  PIANO_DEPLOY_KEY   SSH 私钥路径（默认 ~/.ssh/id_ed25519；存在则优先密钥登录）
+  PIANO_DEPLOY_PWD   SSH 密码（无密钥时使用）
+
+VPN 说明(2026-10-04 起)：隧道由 zju-connect(aTrust 协议) systemd 服务提供
+（部署方法见本仓库 zju-atrust-vpn skill，HTTP 代理 127.0.0.1:8888），
+旧 easyconnect 容器方案已被浙大下线，勿再使用。
+vpn-health.timer 每分钟端到端探测隧道，连续失败自动重启自愈。
+
+计划 targets 以服务器为准（网页控制台在线编辑），默认不上传本地 targets；
 确需用本地 config.json 整体覆盖时加参数 --config。
 """
 import argparse
 import json
 import os
-import time
 from pathlib import Path
+
 import paramiko
 
 ap = argparse.ArgumentParser()
@@ -16,15 +27,19 @@ ap.add_argument("--config", action="store_true",
                 help="用本地 config.json 整体覆盖服务器配置(含 targets)")
 args = ap.parse_args()
 
-HOST, USER, PWD = (os.environ.get("PIANO_DEPLOY_HOST", ""),
-                   os.environ.get("PIANO_DEPLOY_USER", "root"),
-                   os.environ.get("PIANO_DEPLOY_PWD", ""))
-if not HOST or not PWD:
-    raise SystemExit("请先设置环境变量 PIANO_DEPLOY_HOST / PIANO_DEPLOY_USER(默认 root)"
-                     " / PIANO_DEPLOY_PWD 指向你自己的服务器")
+HOST = os.environ.get("PIANO_DEPLOY_HOST", "")
+USER = os.environ.get("PIANO_DEPLOY_USER", "root")
+KEY = os.environ.get("PIANO_DEPLOY_KEY",
+                     str(Path.home() / ".ssh" / "id_ed25519"))
+PWD = os.environ.get("PIANO_DEPLOY_PWD", "")
+if not HOST or not (os.path.isfile(KEY) or PWD):
+    raise SystemExit("请先设置环境变量 PIANO_DEPLOY_HOST / PIANO_DEPLOY_USER(默认 root) "
+                     "/ PIANO_DEPLOY_KEY(默认 ~/.ssh/id_ed25519) 或 PIANO_DEPLOY_PWD "
+                     "指向你自己的服务器")
+kwargs = {"key_filename": KEY} if os.path.isfile(KEY) else {"password": PWD}
 ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect(HOST, username=USER, password=PWD, timeout=20)
+ssh.connect(HOST, username=USER, timeout=20, **kwargs)
 
 
 def run(cmd, timeout=180, show=True):
@@ -41,6 +56,8 @@ def run(cmd, timeout=180, show=True):
         print()
     return code
 
+
+run("mkdir -p /opt/piano-booking")
 
 # 1. 上传脚本(与本脚本同目录)
 HERE = Path(__file__).resolve().parent
@@ -63,44 +80,27 @@ if server_targets is not None and not args.config:
 sftp.remove("/opt/piano-booking/config.json")
 with sftp.open("/opt/piano-booking/config.json", "w") as f:
     f.write(json.dumps(cfg, ensure_ascii=False, indent=2))
-sftp.close()
-print("=== 文件已上传 ===\n")
 
-# 3. 健康检查脚本+timer: 放票前 07:40 自愈
-run("cat > /opt/piano-booking/vpn_health.sh <<'EOF'\n"
-    "#!/bin/bash\n"
-    "# EasyConnect 代理健康检查: 不通则重启容器(重建隧道), 日志写 journald\n"
-    "if ! curl -sk -x http://127.0.0.1:8888 -o /dev/null --max-time 15 \\\n"
-    "     https://myarts.zju.edu.cn/service/api/sso/login-url; then\n"
-    "    echo \"[$(date '+%F %T')] VPN proxy down, restarting easyconnect\"\n"
-    "    docker restart easyconnect\n"
-    "    sleep 45\n"
-    "    if curl -sk -x http://127.0.0.1:8888 -o /dev/null --max-time 15 \\\n"
-    "       https://myarts.zju.edu.cn/service/api/sso/login-url; then\n"
-    "        echo \"[$(date '+%F %T')] VPN proxy recovered\"\n"
-    "    else\n"
-    "        echo \"[$(date '+%F %T')] VPN proxy STILL down after restart\"\n"
-    "    fi\n"
-    "else\n"
-    "    echo \"[$(date '+%F %T')] VPN proxy OK\"\n"
-    "fi\n"
-    "EOF\n"
-    "chmod +x /opt/piano-booking/vpn_health.sh")
+# 3. 健康检查脚本+timer: 每分钟端到端深度探测, 连续 2 次失败才重启,
+#    重启后验证 + 退避冷却(2026-10-25 升级, 详见 vpn_health.sh 头注释)
+sftp.put(str(HERE / "vpn_health.sh"), "/opt/piano-booking/vpn_health.sh")
+sftp.close()
+run("chmod +x /opt/piano-booking/vpn_health.sh")
 
 svc = """[Unit]
-Description=EasyConnect VPN proxy health check for piano booking
+Description=Deep health check & auto-heal for zju-connect tunnel and piano-web
 
 [Service]
 Type=oneshot
 ExecStart=/opt/piano-booking/vpn_health.sh
 """
 tmr = """[Unit]
-Description=Check VPN proxy before booking time
+Description=Probe VPN tunnel end-to-end every minute and self-heal
 
 [Timer]
-OnCalendar=*-*-* 07:40:00
-OnBootSec=10min
-OnUnitActiveSec=6h
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=5s
 Persistent=false
 Unit=vpn-health.service
 
