@@ -31,6 +31,7 @@
 | [piano-room-booking](piano-room-booking/) | 浙大琴房自动预约：放票时刻自动抢 + 候补捡漏 + 签到监控 + 飞书通知，多人共享（注册/优先级/总控制台），手机网页管理 | 需自有服务器 + 校网隧道（配 zju-atrust-vpn） |
 | [mineru-md](mineru-md/) | PDF/图片/Office 经 MinerU API 高保真转 Markdown（公式/表格/双栏/扫描件，图片本地化） | 云端 API，只发可公开的文档 |
 | [zju-literature-downloader-skill](zju-literature-downloader-skill/) | 经你已登录的浙大图书馆/WebVPN 浏览器会话批量下载文献 PDF/SI，含 manifest、校验与验证重试 | 只用你自己的机构订阅权限，不绕付费墙 |
+| [zhiyun-lecture-notes](zhiyun-lecture-notes/) | 浙大智云课堂课次素材抓取（PPT 板书/语音转写/回放）+ 教材级讲义整理；纯板书课回放抽帧重建板书，未选的课可旁听 | 统一认证登录；限速单实例，只读 |
 | [wechat-article-reader](wechat-article-reader/) | 微信公众号推文完整归档（Markdown + 本地化图片音视频），免登录读最新推送 | 被风控时有浏览器兜底 |
 
 ## 怎么用

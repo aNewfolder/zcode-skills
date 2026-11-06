@@ -17,3 +17,9 @@ users.json
 watch.json
 hub_state.json
 users/
+
+# zhiyun-lecture-notes 运行时敏感文件
+sessions/
+state.json
+.lock
+journal/
